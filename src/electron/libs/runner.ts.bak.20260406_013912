@@ -8,8 +8,6 @@ export type RunnerOptions = {
   resumeSessionId?: string;
   /** When true, use forkSession to create a proper continuation branch for execution */
   forkResume?: boolean;
-  /** When true, enable autonomous mode — never ask user, always decide and act */
-  autonomous?: boolean;
   onEvent: (event: ServerEvent) => void;
   onSessionUpdate?: (updates: Partial<Session>) => void;
 };
@@ -20,20 +18,8 @@ export type RunnerHandle = {
 
 const DEFAULT_CWD = process.cwd();
 
-// System prompt injected in autonomous mode — forces AI to never ask questions
-const AUTONOMOUS_SYSTEM_HINT = `
-IMPORTANT: You are running in AUTONOMOUS MODE.
-- NEVER ask the user for confirmation, clarification, or permission.
-- NEVER use AskUserQuestion or any tool that requires human input.
-- Make all decisions yourself using your best judgment.
-- If requirements are unclear, make reasonable assumptions and proceed.
-- If you encounter errors, try to fix them yourself.
-- Only stop when the task is fully complete or fundamentally impossible.
-- When complete, clearly state what was done so the orchestrator knows.
-`;
-
 export async function runClaude(options: RunnerOptions): Promise<RunnerHandle> {
-  const { prompt, session, resumeSessionId, forkResume, autonomous, onEvent, onSessionUpdate } = options;
+  const { prompt, session, resumeSessionId, forkResume, onEvent, onSessionUpdate } = options;
   const abortController = new AbortController();
 
   const sendMessage = (message: SDKMessage) => {
@@ -43,16 +29,18 @@ export async function runClaude(options: RunnerOptions): Promise<RunnerHandle> {
     });
   };
 
-  // Effective prompt: prepend autonomous hint when enabled
-  const effectivePrompt = autonomous
-    ? `${AUTONOMOUS_SYSTEM_HINT}\n\n---\n\nUser task:\n${prompt}`
-    : prompt;
+  const sendPermissionRequest = (toolUseId: string, toolName: string, input: unknown) => {
+    onEvent({
+      type: "permission.request",
+      payload: { sessionId: session.id, toolUseId, toolName, input }
+    });
+  };
 
   // Start the query in the background
   (async () => {
     try {
       const q = query({
-        prompt: effectivePrompt,
+        prompt,
         options: {
           cwd: session.cwd ?? DEFAULT_CWD,
           resume: resumeSessionId,
@@ -63,20 +51,34 @@ export async function runClaude(options: RunnerOptions): Promise<RunnerHandle> {
           includePartialMessages: true,
           allowDangerouslySkipPermissions: true,
           canUseTool: async (toolName, input, { signal }) => {
-            // AUTONOMOUS MODE: auto-approve ALL tools including AskUserQuestion
-            if (autonomous && toolName === "AskUserQuestion") {
-              // Log that we're auto-answering an AskUserQuestion
-              console.log(`[autonomous] Auto-approving AskUserQuestion: ${JSON.stringify(input).slice(0, 200)}`);
-              // Auto-answer with a "proceed" response
-              return { behavior: "allow", updatedInput: { answer: "Proceed with your best judgment. Do not ask for clarification." } };
-            }
-
-            // For AskUserQuestion (non-autonomous), still auto-approve with a generic response
+            // For AskUserQuestion, we need to wait for user response
             if (toolName === "AskUserQuestion") {
-              return { behavior: "allow", updatedInput: input };
+              const toolUseId = crypto.randomUUID();
+
+              // Send permission request to frontend
+              sendPermissionRequest(toolUseId, toolName, input);
+
+              // Create a promise that will be resolved when user responds
+              return new Promise<PermissionResult>((resolve) => {
+                session.pendingPermissions.set(toolUseId, {
+                  toolUseId,
+                  toolName,
+                  input,
+                  resolve: (result) => {
+                    session.pendingPermissions.delete(toolUseId);
+                    resolve(result as PermissionResult);
+                  }
+                });
+
+                // Handle abort
+                signal.addEventListener("abort", () => {
+                  session.pendingPermissions.delete(toolUseId);
+                  resolve({ behavior: "deny", message: "Session aborted" });
+                });
+              });
             }
 
-            // Auto-approve all other tools
+            // Auto-approve other tools
             return { behavior: "allow", updatedInput: input };
           }
         }

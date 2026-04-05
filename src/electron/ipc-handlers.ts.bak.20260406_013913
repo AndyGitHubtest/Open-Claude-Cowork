@@ -10,25 +10,8 @@ const DB_PATH = join(app.getPath("userData"), "sessions.db");
 const sessions = new SessionStore(DB_PATH);
 const runnerHandles = new Map<string, RunnerHandle>();
 
-// Enhanced auto-loop: stores original prompt + idle detection + retry
-type AutoLoopConfig = {
-  maxIterations: number;
-  currentIteration: number;
-  originalPrompt: string;       // Remember the full original task
-  retryCount: number;           // Consecutive error retries
-  maxRetries: number;
-  lastActivityMs: number;       // Heartbeat tracking
-  idleTimeoutMs: number;        // How long before auto-nudge
-  idleNudgeTimer: ReturnType<typeof setTimeout> | null;
-};
-
-const autoLoopSessions = new Map<string, AutoLoopConfig>();
-
-const IDLE_TIMEOUT_MS = 45_000;  // 45 seconds of no output → auto-nudge
-const MAX_IDLE_NUDGES = 5;       // Max nudges before giving up
-const MAX_RETRIES = 3;           // Retry on error
-
-let idleNudgeCounts = new Map<string, number>();
+// Auto-loop mode: sessions that automatically continue after completion
+const autoLoopSessions = new Map<string, { maxIterations: number; currentIteration: number }>();
 
 function broadcast(event: ServerEvent) {
   const payload = JSON.stringify(event);
@@ -38,114 +21,27 @@ function broadcast(event: ServerEvent) {
   }
 }
 
-// Reset idle timer for a session
-function resetIdleTimer(sessionId: string) {
-  const config = autoLoopSessions.get(sessionId);
-  if (!config) return;
-
-  config.lastActivityMs = Date.now();
-
-  // Clear old timer
-  if (config.idleNudgeTimer) {
-    clearTimeout(config.idleNudgeTimer);
-    config.idleNudgeTimer = null;
-  }
-
-  // Set new idle nudge timer
-  config.idleNudgeTimer = setTimeout(() => {
-    const cfg = autoLoopSessions.get(sessionId);
-    if (!cfg) return;
-
-    const nudgeCount = idleNudgeCounts.get(sessionId) || 0;
-    if (nudgeCount >= MAX_IDLE_NUDGES) {
-      console.log(`[auto-loop] Session ${sessionId} idle too long (${nudgeCount} nudges), stopping`);
-      idleNudgeCounts.delete(sessionId);
-      autoLoopSessions.delete(sessionId);
-      return;
-    }
-
-    idleNudgeCounts.set(sessionId, nudgeCount + 1);
-    console.log(`[auto-loop] Session ${sessionId} idle for ${IDLE_TIMEOUT_MS / 1000}s, sending nudge (${nudgeCount + 1}/${MAX_IDLE_NUDGES})`);
-
-    // Force a completion signal so the auto-loop continues
-    const session = sessions.getSession(sessionId);
-    if (session) {
-      // Abort current runner
-      const handle = runnerHandles.get(sessionId);
-      if (handle) {
-        handle.abort();
-        runnerHandles.delete(sessionId);
-      }
-
-      // Mark as completed so autoContinue triggers
-      cfg.lastActivityMs = Date.now();
-      autoContinueSession(sessionId);
-    }
-  }, config.idleTimeoutMs);
-}
-
-// Create a new auto-loop config
-function createAutoLoopConfig(originalPrompt: string): AutoLoopConfig {
-  return {
-    maxIterations: 50,
-    currentIteration: 0,
-    originalPrompt,
-    retryCount: 0,
-    maxRetries: MAX_RETRIES,
-    lastActivityMs: Date.now(),
-    idleTimeoutMs: IDLE_TIMEOUT_MS,
-    idleNudgeTimer: null,
-  };
-}
-
 function emit(event: ServerEvent) {
-  // Reset idle timer on any activity
-  if (event.type === "stream.message" || event.type === "session.status") {
-    const sid = event.type === "session.status"
-      ? event.payload.sessionId
-      : event.payload?.sessionId;
-    if (sid) {
-      resetIdleTimer(sid);
-    }
-  }
-
   if (event.type === "session.status") {
     sessions.updateSession(event.payload.sessionId, { status: event.payload.status });
 
-    // Auto-loop: when session completes, automatically continue
+    // Auto-loop: when session completes, automatically continue if in loop mode
     if (event.payload.status === "completed") {
       const sessionId = event.payload.sessionId;
-      const config = autoLoopSessions.get(sessionId);
-      if (config) {
-        config.retryCount = 0; // Reset retry counter on success
-        config.currentIteration++;
-        console.log(`[auto-loop] Iteration ${config.currentIteration}/${config.maxIterations} for session ${sessionId}`);
-
-        if (config.currentIteration < config.maxIterations) {
+      const loopConfig = autoLoopSessions.get(sessionId);
+      if (loopConfig) {
+        const session = sessions.getSession(sessionId);
+        if (session && session.claudeSessionId && loopConfig.currentIteration < loopConfig.maxIterations) {
+          loopConfig.currentIteration++;
+          // Continue with a "keep working" prompt
           autoContinueSession(sessionId);
-        } else {
-          console.log(`[auto-loop] Max iterations (${config.maxIterations}) reached for session ${sessionId}`);
-          cleanupSession(sessionId);
+        } else if (loopConfig && loopConfig.currentIteration >= loopConfig.maxIterations) {
+          // Max iterations reached, stop auto-loop
+          autoLoopSessions.delete(sessionId);
         }
       }
     }
-
-    // On error, retry with backoff
-    if (event.payload.status === "error") {
-      const sessionId = event.payload.sessionId;
-      const config = autoLoopSessions.get(sessionId);
-      if (config && config.retryCount < config.maxRetries) {
-        config.retryCount++;
-        const delay = Math.min(2000 * Math.pow(2, config.retryCount - 1), 10000);
-        console.log(`[auto-loop] Error on iteration ${config.currentIteration}, retry ${config.retryCount}/${config.maxRetries} in ${delay}ms`);
-        setTimeout(() => autoContinueSession(sessionId), delay);
-      } else if (config) {
-        console.log(`[auto-loop] Max retries reached for session ${sessionId}, stopping`);
-        cleanupSession(sessionId);
-      }
-    }
   }
-
   if (event.type === "stream.message") {
     sessions.recordMessage(event.payload.sessionId, event.payload.message);
   }
@@ -158,29 +54,10 @@ function emit(event: ServerEvent) {
   broadcast(event);
 }
 
-// Clean up all resources for a session
-function cleanupSession(sessionId: string) {
-  const config = autoLoopSessions.get(sessionId);
-  if (config?.idleNudgeTimer) {
-    clearTimeout(config.idleNudgeTimer);
-    config.idleNudgeTimer = null;
-  }
-  idleNudgeCounts.delete(sessionId);
-  autoLoopSessions.delete(sessionId);
-  runnerHandles.delete(sessionId);
-}
-
-// Continue a session autonomously with the full original task context
+// Automatically continue a session with a "keep working" prompt
 async function autoContinueSession(sessionId: string) {
   const session = sessions.getSession(sessionId);
-  if (!session || !session.claudeSessionId) {
-    console.log(`[auto-loop] Cannot continue session ${sessionId}: no session or no claudeSessionId`);
-    cleanupSession(sessionId);
-    return;
-  }
-
-  const config = autoLoopSessions.get(sessionId);
-  if (!config) return;
+  if (!session || !session.claudeSessionId) return;
 
   // Update status to running
   sessions.updateSession(session.id, { status: "running" });
@@ -189,28 +66,12 @@ async function autoContinueSession(sessionId: string) {
     payload: { sessionId: session.id, status: "running", title: session.title, cwd: session.cwd }
   });
 
-  // Smart continue prompt: reference original task + summarize progress
-  const continuePrompt = [
-    `You are continuing work on this original task:`,
-    `"""`,
-    config.originalPrompt,
-    `"""`,
-    ``,
-    `Instructions:`,
-    `- Review what you have done so far in this session.`,
-    `- Identify what remains incomplete or needs improvement.`,
-    `- Continue working autonomously without asking for clarification.`,
-    `- If the task is fully complete, state "TASK COMPLETE" and summarize deliverables.`,
-    `- If blocked by a fundamental issue, document the blocker and suggest an alternative approach.`,
-    `- Do NOT ask the user any questions. Make decisions yourself.`
-  ].join("\n");
+  const continuePrompt = "Continue working on the current task. If the previous task is complete, identify the next logical step and proceed.";
 
   broadcast({
     type: "stream.user_prompt",
     payload: { sessionId: session.id, prompt: continuePrompt }
   });
-
-  resetIdleTimer(sessionId);
 
   try {
     const handle = await runClaude({
@@ -218,7 +79,6 @@ async function autoContinueSession(sessionId: string) {
       session,
       resumeSessionId: session.claudeSessionId,
       forkResume: true,
-      autonomous: true,  // Full autonomous mode
       onEvent: emit,
       onSessionUpdate: (updates) => {
         sessions.updateSession(session.id, updates);
@@ -226,13 +86,13 @@ async function autoContinueSession(sessionId: string) {
     });
     runnerHandles.set(session.id, handle);
   } catch (error) {
-    console.error(`[auto-loop] Failed to continue session ${sessionId}:`, error);
     sessions.updateSession(session.id, { status: "error" });
     broadcast({
       type: "session.status",
       payload: { sessionId: session.id, status: "error", title: session.title, cwd: session.cwd, error: String(error) }
     });
-    // Let the error handler in emit() decide whether to retry
+    // Stop auto-loop on error
+    autoLoopSessions.delete(sessionId);
   }
 }
 
@@ -287,16 +147,14 @@ export async function handleClientEvent(event: ClientEvent) {
       payload: { sessionId: session.id, prompt: event.payload.prompt }
     });
 
-    // Enable auto-loop with full context
-    autoLoopSessions.set(session.id, createAutoLoopConfig(event.payload.prompt));
-    resetIdleTimer(session.id);
+    // Enable auto-loop by default (max 50 iterations)
+    autoLoopSessions.set(session.id, { maxIterations: 50, currentIteration: 0 });
 
     runClaude({
       prompt: event.payload.prompt,
       session,
       resumeSessionId: session.claudeSessionId,
-      forkResume: true,
-      autonomous: true,  // Full autonomous mode from the start
+      forkResume: true,  // Enable fork for proper session continuation
       onEvent: emit,
       onSessionUpdate: (updates) => {
         sessions.updateSession(session.id, updates);
@@ -352,23 +210,14 @@ export async function handleClientEvent(event: ClientEvent) {
       payload: { sessionId: session.id, prompt: event.payload.prompt }
     });
 
-    // Use the new prompt as a sub-task but keep original context if available
-    const existingConfig = autoLoopSessions.get(session.id);
-    if (existingConfig) {
-      existingConfig.currentIteration = 0;
-      existingConfig.retryCount = 0;
-      existingConfig.lastActivityMs = Date.now();
-    } else {
-      autoLoopSessions.set(session.id, createAutoLoopConfig(event.payload.prompt));
-    }
-    resetIdleTimer(session.id);
+    // Enable auto-loop for continue as well
+    autoLoopSessions.set(session.id, { maxIterations: 50, currentIteration: 0 });
 
     runClaude({
       prompt: event.payload.prompt,
       session,
       resumeSessionId: session.claudeSessionId,
-      forkResume: true,
-      autonomous: true,
+      forkResume: true,  // Enable fork for proper session continuation
       onEvent: emit,
       onSessionUpdate: (updates) => {
         sessions.updateSession(session.id, updates);
@@ -398,7 +247,8 @@ export async function handleClientEvent(event: ClientEvent) {
     const session = sessions.getSession(event.payload.sessionId);
     if (!session) return;
 
-    cleanupSession(session.id);
+    // Disable auto-loop
+    autoLoopSessions.delete(session.id);
 
     const handle = runnerHandles.get(session.id);
     if (handle) {
@@ -417,7 +267,8 @@ export async function handleClientEvent(event: ClientEvent) {
   if (event.type === "session.delete") {
     const sessionId = event.payload.sessionId;
 
-    cleanupSession(sessionId);
+    // Disable auto-loop
+    autoLoopSessions.delete(sessionId);
 
     const handle = runnerHandles.get(sessionId);
     if (handle) {
@@ -425,6 +276,8 @@ export async function handleClientEvent(event: ClientEvent) {
       runnerHandles.delete(sessionId);
     }
 
+    // Always try to delete and emit deleted event
+    // Don't emit error if session doesn't exist - it may have already been deleted
     sessions.deleteSession(sessionId);
     emit({
       type: "session.deleted",
