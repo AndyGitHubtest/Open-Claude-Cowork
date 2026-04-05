@@ -154,6 +154,7 @@ export async function handleClientEvent(event: ClientEvent) {
       prompt: event.payload.prompt,
       session,
       resumeSessionId: session.claudeSessionId,
+      forkResume: true,  // Enable fork for proper session continuation
       onEvent: emit,
       onSessionUpdate: (updates) => {
         sessions.updateSession(session.id, updates);
@@ -216,6 +217,7 @@ export async function handleClientEvent(event: ClientEvent) {
       prompt: event.payload.prompt,
       session,
       resumeSessionId: session.claudeSessionId,
+      forkResume: true,  // Enable fork for proper session continuation
       onEvent: emit,
       onSessionUpdate: (updates) => {
         sessions.updateSession(session.id, updates);

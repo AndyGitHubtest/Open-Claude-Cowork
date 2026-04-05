@@ -13,8 +13,8 @@ export function useIPC(onEvent: (event: ServerEvent) => void) {
 
   useEffect(() => {
     // Subscribe to server events
-    const unsubscribe = window.electron.onServerEvent((event: ServerEvent) => {
-      onEventRef.current(event);
+    const unsubscribe = window.electron.onServerEvent((event: unknown) => {
+      onEventRef.current(event as ServerEvent);
     });
 
     unsubscribeRef.current = unsubscribe;

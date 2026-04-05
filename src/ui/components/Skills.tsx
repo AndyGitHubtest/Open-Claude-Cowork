@@ -41,7 +41,9 @@ export function Skills({ sendEvent }: SkillsProps) {
     if (!cwd) return;
 
     try {
-      const result = await (window as { electron?: { selectDirectory?: () => Promise<string | null> } }).electron?.selectDirectory();
+      const electronApi = (window as { electron?: { selectDirectory?: () => Promise<string | null> } }).electron;
+      if (!electronApi?.selectDirectory) { setSkillsError("Electron API not available"); return; }
+      const result = await electronApi.selectDirectory();
 
       if (result) {
         setSkillsLoading(true);

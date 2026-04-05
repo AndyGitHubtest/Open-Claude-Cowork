@@ -20,7 +20,9 @@ export function WorkspaceSelector() {
 
   const handleSelectDirectory = async () => {
     try {
-      const result = await (window as { electron?: { selectDirectory?: () => Promise<string | null> } }).electron?.selectDirectory();
+      const electronApi = (window as { electron?: { selectDirectory?: () => Promise<string | null> } }).electron;
+      if (!electronApi?.selectDirectory) { console.error("Electron API not available"); return; }
+      const result = await electronApi.selectDirectory();
       if (result) {
         addWorkspace(result);
         setWorkspaceSelectorOpen(false);

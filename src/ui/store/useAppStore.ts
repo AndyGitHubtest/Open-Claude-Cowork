@@ -173,7 +173,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addWorkspace: (path) => {
-    const { workspaces, cwd } = get();
+    const { workspaces } = get();
     const existing = workspaces.find(w => w.path === path);
     if (existing) {
       set({ activeWorkspaceId: existing.id, cwd: path });
