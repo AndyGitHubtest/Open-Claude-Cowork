@@ -24,4 +24,4 @@ dist-electron
 *.sln
 *.sw?
 
-.env
+.env.worktrees/
