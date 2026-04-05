@@ -10,6 +10,9 @@ const DB_PATH = join(app.getPath("userData"), "sessions.db");
 const sessions = new SessionStore(DB_PATH);
 const runnerHandles = new Map<string, RunnerHandle>();
 
+// Auto-loop mode: sessions that automatically continue after completion
+const autoLoopSessions = new Map<string, { maxIterations: number; currentIteration: number }>();
+
 function broadcast(event: ServerEvent) {
   const payload = JSON.stringify(event);
   const windows = BrowserWindow.getAllWindows();
@@ -21,6 +24,23 @@ function broadcast(event: ServerEvent) {
 function emit(event: ServerEvent) {
   if (event.type === "session.status") {
     sessions.updateSession(event.payload.sessionId, { status: event.payload.status });
+
+    // Auto-loop: when session completes, automatically continue if in loop mode
+    if (event.payload.status === "completed") {
+      const sessionId = event.payload.sessionId;
+      const loopConfig = autoLoopSessions.get(sessionId);
+      if (loopConfig) {
+        const session = sessions.getSession(sessionId);
+        if (session && session.claudeSessionId && loopConfig.currentIteration < loopConfig.maxIterations) {
+          loopConfig.currentIteration++;
+          // Continue with a "keep working" prompt
+          autoContinueSession(sessionId);
+        } else if (loopConfig && loopConfig.currentIteration >= loopConfig.maxIterations) {
+          // Max iterations reached, stop auto-loop
+          autoLoopSessions.delete(sessionId);
+        }
+      }
+    }
   }
   if (event.type === "stream.message") {
     sessions.recordMessage(event.payload.sessionId, event.payload.message);
@@ -32,6 +52,47 @@ function emit(event: ServerEvent) {
     });
   }
   broadcast(event);
+}
+
+// Automatically continue a session with a "keep working" prompt
+async function autoContinueSession(sessionId: string) {
+  const session = sessions.getSession(sessionId);
+  if (!session || !session.claudeSessionId) return;
+
+  // Update status to running
+  sessions.updateSession(session.id, { status: "running" });
+  broadcast({
+    type: "session.status",
+    payload: { sessionId: session.id, status: "running", title: session.title, cwd: session.cwd }
+  });
+
+  const continuePrompt = "Continue working on the current task. If the previous task is complete, identify the next logical step and proceed.";
+
+  broadcast({
+    type: "stream.user_prompt",
+    payload: { sessionId: session.id, prompt: continuePrompt }
+  });
+
+  try {
+    const handle = await runClaude({
+      prompt: continuePrompt,
+      session,
+      resumeSessionId: session.claudeSessionId,
+      onEvent: emit,
+      onSessionUpdate: (updates) => {
+        sessions.updateSession(session.id, updates);
+      }
+    });
+    runnerHandles.set(session.id, handle);
+  } catch (error) {
+    sessions.updateSession(session.id, { status: "error" });
+    broadcast({
+      type: "session.status",
+      payload: { sessionId: session.id, status: "error", title: session.title, cwd: session.cwd, error: String(error) }
+    });
+    // Stop auto-loop on error
+    autoLoopSessions.delete(sessionId);
+  }
 }
 
 export async function handleClientEvent(event: ClientEvent) {
@@ -84,6 +145,9 @@ export async function handleClientEvent(event: ClientEvent) {
       type: "stream.user_prompt",
       payload: { sessionId: session.id, prompt: event.payload.prompt }
     });
+
+    // Enable auto-loop by default (max 50 iterations)
+    autoLoopSessions.set(session.id, { maxIterations: 50, currentIteration: 0 });
 
     runClaude({
       prompt: event.payload.prompt,
@@ -144,6 +208,9 @@ export async function handleClientEvent(event: ClientEvent) {
       payload: { sessionId: session.id, prompt: event.payload.prompt }
     });
 
+    // Enable auto-loop for continue as well
+    autoLoopSessions.set(session.id, { maxIterations: 50, currentIteration: 0 });
+
     runClaude({
       prompt: event.payload.prompt,
       session,
@@ -177,6 +244,9 @@ export async function handleClientEvent(event: ClientEvent) {
     const session = sessions.getSession(event.payload.sessionId);
     if (!session) return;
 
+    // Disable auto-loop
+    autoLoopSessions.delete(session.id);
+
     const handle = runnerHandles.get(session.id);
     if (handle) {
       handle.abort();
@@ -193,6 +263,10 @@ export async function handleClientEvent(event: ClientEvent) {
 
   if (event.type === "session.delete") {
     const sessionId = event.payload.sessionId;
+
+    // Disable auto-loop
+    autoLoopSessions.delete(sessionId);
+
     const handle = runnerHandles.get(sessionId);
     if (handle) {
       handle.abort();
