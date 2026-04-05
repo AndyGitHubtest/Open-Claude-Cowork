@@ -78,7 +78,6 @@ async function autoContinueSession(sessionId: string) {
       prompt: continuePrompt,
       session,
       resumeSessionId: session.claudeSessionId,
-      forkResume: true,
       onEvent: emit,
       onSessionUpdate: (updates) => {
         sessions.updateSession(session.id, updates);

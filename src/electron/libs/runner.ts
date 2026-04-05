@@ -6,6 +6,8 @@ export type RunnerOptions = {
   prompt: string;
   session: Session;
   resumeSessionId?: string;
+  /** When true, use forkSession to create a proper continuation branch for execution */
+  forkResume?: boolean;
   onEvent: (event: ServerEvent) => void;
   onSessionUpdate?: (updates: Partial<Session>) => void;
 };
@@ -17,7 +19,7 @@ export type RunnerHandle = {
 const DEFAULT_CWD = process.cwd();
 
 export async function runClaude(options: RunnerOptions): Promise<RunnerHandle> {
-  const { prompt, session, resumeSessionId, onEvent, onSessionUpdate } = options;
+  const { prompt, session, resumeSessionId, forkResume, onEvent, onSessionUpdate } = options;
   const abortController = new AbortController();
 
   const sendMessage = (message: SDKMessage) => {
